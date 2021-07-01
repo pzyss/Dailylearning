@@ -25,11 +25,12 @@
             printf("%s %d CUBLAS FAIL %s\n", __FILE__, __LINE__, cublasGetErrorString(status)); \
         }                                                                                       \
     } while (0)
+
 namespace nvinfer1
 {
 namespace plugin
 {
-size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)
+size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)//输入输出使用同一空间(acrossSpatial==true)则返回0，否则返回实际所需空间大小
 {
     if (acrossSpatial)
         return sizeof(float) * C * H * W;
@@ -39,7 +40,7 @@ size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)
 } // namespace plugin
 } // namespace nvinfer1
 
-size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)
+size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)//不同命名空间的normalizePluginWorkspaceSize同名函数
 {
     if (acrossSpatial)
         return sizeof(float) * C * H * W;
@@ -47,8 +48,8 @@ size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)
         return (size_t) 0;
 }
 
-template <unsigned nthds_per_cta>
-__launch_bounds__(nthds_per_cta)
+template <unsigned nthds_per_cta>  //模板函数，nthds_per_cta为unsigned型变量
+__launch_bounds__(nthds_per_cta)   //限定条件，SM内线程数不超过nthds_per_cta；可优化内核执行，深层机理未知
     __global__ void normalizeNotAcrossSpatialKernel(
         const bool channelShared,
         const int N,
@@ -58,13 +59,13 @@ __launch_bounds__(nthds_per_cta)
         const float eps,
         const float* scale,
         float* inputData,
-        float* outputData)
+        float* outputData)      //normalize核函数，输入输出分开存放
 {
-    const int dim = C * H * W;
-    const int spatialDim = H * W;
-    const int tile = 32;
-    const int numTile = (spatialDim + tile - 1) / tile;
-    for (int n = blockIdx.x; n < N * numTile; n += gridDim.x)
+    const int dim = C * H * W;     //单个实例所需存储空间
+    const int spatialDim = H * W;   //单实例单通道所需空间
+    const int tile = 32;            /**************************************划分的最小单元？*********************************/
+    const int numTile = (spatialDim + tile - 1) / tile;    //单实例单通道包含的最小单元数目
+    for (int n = blockIdx.x; n < N * numTile; n += gridDim.x)   
     {
         float* input = inputData + (n / numTile) * dim;
         float* output = outputData + (n / numTile) * dim;
