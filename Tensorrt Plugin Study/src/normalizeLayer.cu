@@ -30,7 +30,7 @@ namespace nvinfer1
 {
 namespace plugin
 {
-size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)//输入输出使用同一空间(acrossSpatial==true)则返回0，否则返回实际所需空间大小
+size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)//使用cublascontext进行类似Instance Normalization的计算，需要额外的显存空间
 {
     if (acrossSpatial)
         return sizeof(float) * C * H * W;
@@ -48,6 +48,10 @@ size_t normalizePluginWorkspaceSize(bool acrossSpatial, int C, int H, int W)//�
         return (size_t) 0;
 }
 
+/*
+实现类似batch normalization的功能，输入大小NCHW,将其映射为C*tile行，N*(H*W+tile-1)/tile列的矩阵，n为列标号，i为行标号；
+好像仍然是按单个实例进行计算的
+*/
 template <unsigned nthds_per_cta>  //模板函数，nthds_per_cta为unsigned型变量
 __launch_bounds__(nthds_per_cta)   //限定条件，SM内线程数不超过nthds_per_cta；可优化内核执行，深层机理未知
     __global__ void normalizeNotAcrossSpatialKernel(
@@ -67,16 +71,16 @@ __launch_bounds__(nthds_per_cta)   //限定条件，SM内线程数不超过nthds
     const int numTile = (spatialDim + tile - 1) / tile;    //单实例单通道包含的最小单元数目
     for (int n = blockIdx.x; n < N * numTile; n += gridDim.x)   
     {
-        float* input = inputData + (n / numTile) * dim;
+        float* input = inputData + (n / numTile) * dim;    //单个实例起始地址，后续完成对应实例的处理
         float* output = outputData + (n / numTile) * dim;
-        __shared__ float sum[tile];
+        __shared__ float sum[tile];     //变量初始化  /**********************************shared只在线程块内起作用,无法跨线程共享，实现N间内容的交换*********************************/
         float localsum = 0.0F;
         for (int i = threadIdx.x; i < tile; i += nthds_per_cta)
         {
             sum[i] = 0.0F;
         }
         __syncthreads();
-        for (int i = threadIdx.x; i < C * tile; i += nthds_per_cta)
+        for (int i = threadIdx.x; i < C * tile; i += nthds_per_cta) //坐标转换，计算平方和，按线程号将整体CHW数据均分成32份
         {
             int row = i / tile;
             int col = (n % numTile) * tile + i % tile;
@@ -87,7 +91,7 @@ __launch_bounds__(nthds_per_cta)   //限定条件，SM内线程数不超过nthds
         }
         atomicAdd(&sum[threadIdx.x & 31], localsum);
         __syncthreads();
-        for (int i = threadIdx.x; i < C * tile; i += nthds_per_cta)
+        for (int i = threadIdx.x; i < C * tile; i += nthds_per_cta) //完成后续变换   /****************与计算公式有所出入，要求input输入已经减完均值？*************/
         {
             int row = i / tile;
             int col = (n % numTile) * tile + i % tile;
@@ -97,7 +101,7 @@ __launch_bounds__(nthds_per_cta)   //限定条件，SM内线程数不超过nthds
                 output[offset] = input[offset] / sqrt(sum[threadIdx.x & 31] + eps);
             }
         }
-        if (channelShared)
+        if (channelShared)  
         {
             for (int i = threadIdx.x; i < C * tile; i += nthds_per_cta)
             {
@@ -130,7 +134,7 @@ pluginStatus_t normalizeNotAcrossSpatialGpu(
     const float eps,
     const void* scale,
     const void* inputData,
-    void* outputData)
+    void* outputData)   //核函数外层接口封装
 {
     const int BS = 128;
     const int GS = 256;
@@ -147,7 +151,7 @@ pluginStatus_t normalizeNotAcrossSpatialGpu(
 __global__ void squareKernel(
     const int n,
     const float* x,
-    float* y)
+    float* y)   //求平方
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < n; i += gridDim.x * blockDim.x)
@@ -161,7 +165,7 @@ __global__ void scalChannelKernel(
     const int spatialDim,
     const float* inputData,
     const float* scale,
-    float* outputData)
+    float* outputData)  //缩放
 {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < n; i += gridDim.x * blockDim.x)
@@ -188,11 +192,11 @@ pluginStatus_t normalizeInference(
     const void* scale,
     const void* inputData,
     void* outputData,
-    void* workspace)
+    void* workspace)  //
 {
     const int dim = C * H * W;
     // Normalization is conducted for each sample from the batch indepdently
-    if (acrossSpatial)
+    if (acrossSpatial) //使用cublascontext每个实例分别计算
     {
         float* input = (float*) const_cast<void*>(inputData);
         float* output = (float*) outputData;
@@ -229,7 +233,7 @@ pluginStatus_t normalizeInference(
         return STATUS_SUCCESS;
     }
     // Normalization ignoring the batch
-    else
+    else //整体计算
     {
         return normalizeNotAcrossSpatialGpu(stream, channelShared, N, C, H, W, eps, scale, inputData, outputData);
     }
@@ -250,11 +254,11 @@ pluginStatus_t normalizeInference(
     const void* scale,
     const void* inputData,
     void* outputData,
-    void* workspace)
+    void* workspace) 
 {
     const int dim = C * H * W;
     // Normalization is conducted for each sample from the batch indepdently
-    if (acrossSpatial)
+    if (acrossSpatial)//使用cublascontext每个实例分别计算
     {
         float* input = (float*) const_cast<void*>(inputData);
         float* output = (float*) outputData;
